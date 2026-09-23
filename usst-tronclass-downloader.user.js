@@ -2,7 +2,7 @@
 // @name         USST 一网畅学课件下载助手
 // @name:zh-CN   USST 一网畅学课件下载助手
 // @namespace    https://github.com/seabodylibra/Tronclass
-// @version      1.0.0
+// @version      1.1.0
 // @description  为上海理工大学一网畅学提供课程附件下载功能，支持 PPT/PDF 等资源。
 // @description:zh-CN 为上海理工大学一网畅学提供课程附件下载功能，支持 PPT/PDF 等资源。
 // @author       seabodylibra
@@ -26,9 +26,12 @@
 
     const state = {
         activityId: null,
+        courseId: null,
         routeKey: '',
         routeVersion: 0,
         references: [],
+        listScope: 'none',
+        courseScanFailures: 0,
         loading: false,
         downloading: false,
         message: '',
@@ -104,6 +107,11 @@
         }
 
         return null;
+    }
+
+    function getCourseId() {
+        const match = window.location.pathname.match(/^\/course\/([A-Za-z0-9_-]+)(?:\/|$)/i);
+        return match ? activityCandidate(match[1]) : null;
     }
 
     function getErrorMessage(error) {
@@ -191,6 +199,13 @@
             ));
     }
 
+    function getCourseActivityArray(payload) {
+        if (!payload || typeof payload !== 'object') return null;
+        if (Array.isArray(payload.activities)) return payload.activities;
+        if (payload.data && Array.isArray(payload.data.activities)) return payload.data.activities;
+        return null;
+    }
+
     function normaliseReferences(payload) {
         const items = getReferenceArray(payload);
         const seen = new Set();
@@ -247,6 +262,7 @@
     async function loadReferences(activityId, routeVersion) {
         if (!activityId || state.loading) return;
         state.loading = true;
+        state.listScope = 'activity';
         state.message = '正在读取附件列表…';
         state.messageKind = 'info';
         state.references = [];
@@ -279,6 +295,108 @@
                 render();
             }
         }
+    }
+
+    async function collectCourseReferences(courseId, routeVersion) {
+        const courseUrl = `${window.location.origin}/api/courses/${encodeURIComponent(courseId)}/activities?sub_course_id=0`;
+        const payload = await requestJson(courseUrl, '读取课程活动列表', null);
+        const activities = getCourseActivityArray(payload);
+        if (!activities) {
+            throw new ApiError('课程活动列表返回结构异常。', 200, '读取课程活动列表');
+        }
+
+        const references = [];
+        const seenReferences = new Set();
+        let failures = 0;
+
+        for (const activity of activities) {
+            if (routeVersion !== state.routeVersion || courseId !== state.courseId) {
+                throw new CancelledError();
+            }
+            if (!activity || activity.id === undefined || activity.id === null) {
+                failures += 1;
+                logWarn('课程活动列表中有项目缺少活动 ID，已跳过。', activity);
+                continue;
+            }
+
+            const activityId = String(activity.id);
+            const activityTitle = pickString(activity.title, activity.name, `活动 ${activityId}`);
+            const endpoint = `${window.location.origin}/api/activities/${encodeURIComponent(activityId)}/upload_references`;
+            try {
+                const activityPayload = await requestJson(endpoint, `读取活动“${activityTitle}”的附件`, null);
+                if (!hasReferenceList(activityPayload)) {
+                    failures += 1;
+                    logWarn(`活动“${activityTitle}”的附件列表结构异常，已跳过。`, activityPayload);
+                    continue;
+                }
+
+                for (const reference of normaliseReferences(activityPayload)) {
+                    if (reference.referenceId && seenReferences.has(reference.referenceId)) {
+                        logWarn(`课程内发现重复 reference ID：${reference.referenceId}，已跳过重复附件。`);
+                        continue;
+                    }
+                    if (reference.referenceId) seenReferences.add(reference.referenceId);
+                    reference.activityId = activityId;
+                    reference.activityTitle = activityTitle;
+                    references.push(reference);
+                }
+            } catch (error) {
+                if (error instanceof CancelledError) throw error;
+                failures += 1;
+                logWarn(`读取活动“${activityTitle}”的附件失败，继续扫描课程其他活动。`, error);
+            }
+        }
+
+        return { references, failures, activityCount: activities.length };
+    }
+
+    async function downloadWholeCourse() {
+        if (!state.courseId || state.loading || state.downloading) return;
+        const courseId = state.courseId;
+        const routeVersion = state.routeVersion;
+        state.loading = true;
+        state.courseScanFailures = 0;
+        state.references = [];
+        state.message = '正在读取本课程活动和附件列表…';
+        state.messageKind = 'info';
+        render();
+
+        let result;
+        try {
+            result = await collectCourseReferences(courseId, routeVersion);
+            if (routeVersion !== state.routeVersion || courseId !== state.courseId) return;
+            state.references = result.references;
+            state.listScope = 'course';
+            state.courseScanFailures = result.failures;
+        } catch (error) {
+            if (error instanceof CancelledError) return;
+            if (routeVersion === state.routeVersion && courseId === state.courseId) {
+                state.message = getErrorMessage(error);
+                state.messageKind = 'error';
+                logError('读取本课程附件列表失败。', error);
+            }
+            return;
+        } finally {
+            if (routeVersion === state.routeVersion && courseId === state.courseId) {
+                state.loading = false;
+                render();
+            }
+        }
+
+        if (routeVersion !== state.routeVersion || courseId !== state.courseId) return;
+        if (!state.references.length) {
+            state.message = result.failures
+                ? `没有找到可下载附件；${result.failures} 个活动读取失败。`
+                : '本课程没有可见附件。';
+            state.messageKind = result.failures ? 'warning' : 'info';
+            render();
+            return;
+        }
+
+        state.message = `已收集 ${state.references.length} 个附件（扫描 ${result.activityCount} 个活动），开始按顺序下载…`;
+        state.messageKind = result.failures ? 'warning' : 'info';
+        render();
+        await runDownloads(state.references.slice(), 'course');
     }
 
     function sanitiseFilename(input, fallback) {
@@ -411,7 +529,8 @@
     }
 
     function ensureRunActive(run) {
-        if (!run || run.cancelled || state.activeRun !== run || run.version !== state.routeVersion || run.activityId !== state.activityId) {
+        if (!run || run.cancelled || state.activeRun !== run || run.version !== state.routeVersion
+            || run.activityId !== state.activityId || run.courseId !== state.courseId) {
             throw new CancelledError();
         }
     }
@@ -469,18 +588,19 @@
         }
     }
 
-    async function runDownloads(references) {
+    async function runDownloads(references, scope = 'activity') {
         if (state.downloading) {
             setMessage('已有下载任务正在进行，请等待当前任务结束。', 'warning');
             return;
         }
-        if (!state.activityId || !references.length) {
+        if ((!state.activityId && scope !== 'course') || !references.length) {
             setMessage('当前没有可下载的附件。', 'warning');
             return;
         }
 
         const run = {
             activityId: state.activityId,
+            courseId: state.courseId,
             version: state.routeVersion,
             cancelled: false,
         };
@@ -491,16 +611,23 @@
         render();
 
         let successCount = 0;
+        let attemptedCount = 0;
         try {
             for (const reference of references) {
                 ensureRunActive(run);
                 if (reference.status.startsWith('已完成')) continue;
+                attemptedCount += 1;
                 if (await downloadReference(reference, run)) successCount += 1;
                 await wait(DOWNLOAD_GAP_MS);
             }
             ensureRunActive(run);
-            state.message = `下载任务完成：${successCount}/${references.length} 个附件成功。`;
-            state.messageKind = successCount === references.length ? 'success' : 'warning';
+            const failedCount = attemptedCount - successCount;
+            const scopeName = scope === 'course' ? '本课程' : '当前活动';
+            const scanNote = scope === 'course' && state.courseScanFailures
+                ? `另有 ${state.courseScanFailures} 个活动读取附件失败。`
+                : '';
+            state.message = `下载完成（${scopeName}）：${successCount}/${attemptedCount} 个附件成功。${scanNote}`;
+            state.messageKind = failedCount === 0 && !state.courseScanFailures ? 'success' : 'warning';
         } catch (error) {
             if (!(error instanceof CancelledError)) {
                 state.message = getErrorMessage(error);
@@ -542,6 +669,7 @@
             #${PANEL_ID} .usst-list { margin: 8px 0 0; padding: 0; list-style: none; }
             #${PANEL_ID} .usst-item { margin: 6px 0; padding: 8px; background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 6px; }
             #${PANEL_ID} .usst-name { display: block; font-weight: 600; word-break: break-word; }
+            #${PANEL_ID} .usst-context { display: block; color: #6b7280; font-size: 12px; word-break: break-word; }
             #${PANEL_ID} .usst-status { display: block; color: #4b5563; font-size: 12px; }
             #${PANEL_ID} .usst-error { display: block; color: #b91c1c; font-size: 12px; word-break: break-word; }
         `;
@@ -553,11 +681,13 @@
         panel.innerHTML = `
             <h2 class="usst-title">一网畅学课件下载助手</h2>
             <div class="usst-meta">活动 ID：<span data-field="activity">未识别</span></div>
+            <div class="usst-meta">课程 ID：<span data-field="course">未识别</span></div>
             <div class="usst-meta">附件数量：<span data-field="count">0</span></div>
             <div class="usst-actions">
                 <button type="button" data-action="refresh">刷新附件</button>
                 <button type="button" data-action="current">下载当前课件</button>
-                <button type="button" class="secondary" data-action="all">下载全部附件</button>
+                <button type="button" class="secondary" data-action="all">下载本活动附件</button>
+                <button type="button" data-action="course">下载本课程全部附件</button>
             </div>
             <div class="usst-message" data-field="message" role="status"></div>
             <ul class="usst-list" data-field="list"></ul>
@@ -567,12 +697,14 @@
         ui = {
             panel,
             activity: panel.querySelector('[data-field="activity"]'),
+            course: panel.querySelector('[data-field="course"]'),
             count: panel.querySelector('[data-field="count"]'),
             message: panel.querySelector('[data-field="message"]'),
             list: panel.querySelector('[data-field="list"]'),
             refresh: panel.querySelector('[data-action="refresh"]'),
             current: panel.querySelector('[data-action="current"]'),
             all: panel.querySelector('[data-action="all"]'),
+            courseAll: panel.querySelector('[data-action="course"]'),
         };
 
         ui.refresh.addEventListener('click', () => {
@@ -585,18 +717,21 @@
         });
         ui.current.addEventListener('click', () => runDownloads(state.references.slice(0, 1)));
         ui.all.addEventListener('click', () => runDownloads(state.references.slice()));
+        ui.courseAll.addEventListener('click', downloadWholeCourse);
         render();
     }
 
     function render() {
         if (!ui) return;
         ui.activity.textContent = state.activityId || '未识别';
+        ui.course.textContent = state.courseId || '未识别';
         ui.count.textContent = String(state.references.length);
         ui.message.textContent = state.message || (state.loading ? '正在处理…' : '');
         ui.message.className = `usst-message ${state.messageKind || 'info'}`;
         ui.refresh.disabled = !state.activityId || state.loading || state.downloading;
-        ui.current.disabled = !state.references.length || state.loading || state.downloading;
-        ui.all.disabled = !state.references.length || state.loading || state.downloading;
+        ui.current.disabled = !state.activityId || state.listScope !== 'activity' || !state.references.length || state.loading || state.downloading;
+        ui.all.disabled = !state.activityId || state.listScope !== 'activity' || !state.references.length || state.loading || state.downloading;
+        ui.courseAll.disabled = !state.courseId || state.loading || state.downloading;
 
         ui.list.replaceChildren();
         state.references.forEach((reference) => {
@@ -605,6 +740,12 @@
             const name = document.createElement('span');
             name.className = 'usst-name';
             name.textContent = reference.name;
+            if (reference.activityTitle) {
+                const context = document.createElement('span');
+                context.className = 'usst-context';
+                context.textContent = reference.activityTitle;
+                item.appendChild(context);
+            }
             const status = document.createElement('span');
             status.className = 'usst-status';
             status.textContent = reference.status;
@@ -627,10 +768,17 @@
         if (state.requestController) state.requestController.abort();
         if (state.activeRun) state.activeRun.cancelled = true;
         state.activityId = getActivityId();
+        state.courseId = getCourseId();
         state.references = [];
+        state.listScope = state.activityId ? 'activity' : 'none';
+        state.courseScanFailures = 0;
         state.loading = false;
-        state.message = state.activityId ? '正在识别当前活动…' : '未识别到活动 ID，请进入课件详情页。';
-        state.messageKind = state.activityId ? 'info' : 'warning';
+        state.message = state.activityId
+            ? '正在识别当前活动…'
+            : state.courseId
+                ? '课程级附件下载可用；当前活动附件请进入课件详情页。'
+                : '未识别到课程或活动页面。';
+        state.messageKind = state.activityId || state.courseId ? 'info' : 'warning';
         render();
         if (state.activityId) loadReferences(state.activityId, state.routeVersion);
     }
