@@ -1,0 +1,14 @@
+# Operating-system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor files
+.idea/
+.vscode/
+*.swp
+
+# Local test artifacts
+work/
+outputs/
+
